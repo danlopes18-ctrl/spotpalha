@@ -104,14 +104,22 @@ app.get('/api/stream/:videoId', async (req, res) => {
 
   console.log(`[STREAM] Iniciando: ${videoId}`);
 
+  // Flags anti-bot: usa cliente iOS que bypassa detecção em servidores cloud
+  const ytdlpBaseArgs = [
+    '--no-playlist',
+    '--quiet',
+    '--no-warnings',
+    '--extractor-args', 'youtube:player_client=ios',
+    '--user-agent', 'com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X;)',
+    ...(process.env.YOUTUBE_COOKIES ? ['--cookies', process.env.YOUTUBE_COOKIES] : []),
+  ];
+
   try {
     // Pega a URL direta do melhor áudio via yt-dlp
     const audioUrl = await ytdlp([
       '-g',                         // só retorna a URL
-      '-f', 'bestaudio[ext=webm]/bestaudio/best',
-      '--no-playlist',
-      '--quiet',
-      '--no-warnings',
+      '-f', 'bestaudio[ext=m4a]/bestaudio/best',
+      ...ytdlpBaseArgs,
       ytUrl,
     ]);
 
@@ -164,10 +172,8 @@ app.get('/api/stream/:videoId', async (req, res) => {
       console.log('[STREAM] Tentando pipe direto via yt-dlp...');
       const proc = spawn(YTDLP, [
         '-o', '-',
-        '-f', 'bestaudio[ext=webm]/bestaudio/best',
-        '--no-playlist',
-        '--quiet',
-        '--no-warnings',
+        '-f', 'bestaudio[ext=m4a]/bestaudio/best',
+        ...ytdlpBaseArgs,
         ytUrl,
       ], { stdio: ['ignore', 'pipe', 'pipe'] });
 
