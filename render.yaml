@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: spot-agrios
+    env: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node setup.js && node server.js
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 3000

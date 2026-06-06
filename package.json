@@ -1,0 +1,21 @@
+{
+  "name": "spot-agrios",
+  "version": "1.0.0",
+  "description": "Spot Ágrios - Player de Música estilo Spotify com YouTube",
+  "main": "server.js",
+  "scripts": {
+    "start": "node setup.js && node server.js",
+    "dev": "node server.js",
+    "postinstall": "node setup.js"
+  },
+  "dependencies": {
+    "@distube/ytdl-core": "^4.14.4",
+    "cors": "^2.8.5",
+    "express": "^4.18.2",
+    "play-dl": "^1.9.7",
+    "youtube-search-api": "^1.1.4"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
