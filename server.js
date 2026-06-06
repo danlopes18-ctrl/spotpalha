@@ -96,104 +96,117 @@ app.get('/api/search', async (req, res) => {
 });
 
 // ──────────────────────────────────────────────────────────────
-// STREAM — yt-dlp como motor principal (mais confiável do mundo)
+// STREAM — yt-dlp com retry em múltiplos clientes YouTube
+// tv_embedded → ios → android → mweb (bypassa bot detection)
 // ──────────────────────────────────────────────────────────────
+
+// Prepara arquivo de cookies (se env var estiver configurada)
+let COOKIES_FILE = null;
+const { writeFileSync } = require('fs');
+if (process.env.YOUTUBE_COOKIES) {
+  COOKIES_FILE = path.join(os.tmpdir(), 'yt-cookies.txt');
+  try {
+    // Suporta conteúdo direto ou base64
+    const content = Buffer.from(process.env.YOUTUBE_COOKIES, 'base64').toString('utf8');
+    writeFileSync(COOKIES_FILE, content.startsWith('# Netscape') ? content : process.env.YOUTUBE_COOKIES);
+    console.log('🍪 Cookies do YouTube carregados');
+  } catch {
+    COOKIES_FILE = null;
+  }
+}
+
+// Clientes YouTube para tentar em ordem (do mais provável ao fallback)
+const YT_CLIENTS = ['tv_embedded', 'ios', 'android_embedded', 'mweb', 'web'];
+
+function buildArgs(client) {
+  return [
+    '--no-playlist', '--quiet', '--no-warnings',
+    '--extractor-args', `youtube:player_client=${client}`,
+    ...(COOKIES_FILE ? ['--cookies', COOKIES_FILE] : []),
+  ];
+}
+
 app.get('/api/stream/:videoId', async (req, res) => {
   const { videoId } = req.params;
   const ytUrl = `https://www.youtube.com/watch?v=${videoId}`;
-
   console.log(`[STREAM] Iniciando: ${videoId}`);
 
-  // Flags anti-bot: usa cliente iOS que bypassa detecção em servidores cloud
-  const ytdlpBaseArgs = [
-    '--no-playlist',
-    '--quiet',
-    '--no-warnings',
-    '--extractor-args', 'youtube:player_client=ios',
-    '--user-agent', 'com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X;)',
-    ...(process.env.YOUTUBE_COOKIES ? ['--cookies', process.env.YOUTUBE_COOKIES] : []),
-  ];
-
-  try {
-    // Pega a URL direta do melhor áudio via yt-dlp
-    const audioUrl = await ytdlp([
-      '-g',                         // só retorna a URL
-      '-f', 'bestaudio[ext=m4a]/bestaudio/best',
-      ...ytdlpBaseArgs,
-      ytUrl,
-    ]);
-
-    if (!audioUrl) throw new Error('URL de áudio vazia');
-
-    console.log(`[STREAM] URL obtida, redirecionando para áudio...`);
-
-    // Faz proxy do áudio para o cliente (resolve CORS)
-    const range    = req.headers.range;
-    const headers  = { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' };
-    if (range) headers['Range'] = range;
-
-    const upstream = await fetch(audioUrl, { headers, signal: AbortSignal.timeout(20000) });
-
-    if (!upstream.ok && upstream.status !== 206) {
-      throw new Error(`HTTP ${upstream.status} na URL de áudio`);
-    }
-
-    // Repassa os headers relevantes
-    const ct  = upstream.headers.get('content-type')  || 'audio/webm';
-    const cl  = upstream.headers.get('content-length');
-    const cr  = upstream.headers.get('content-range');
-
-    res.setHeader('Content-Type', ct);
-    res.setHeader('Accept-Ranges', 'bytes');
-    res.setHeader('Cache-Control', 'no-cache');
-    if (cl) res.setHeader('Content-Length', cl);
-    if (cr) res.setHeader('Content-Range', cr);
-    res.status(upstream.status === 206 ? 206 : 200);
-
-    // Streaming chunk a chunk
-    const reader = upstream.body.getReader();
-    const pump = async () => {
-      try {
-        const { done, value } = await reader.read();
-        if (done || res.writableEnded) { res.end(); return; }
-        res.write(value);
-        pump();
-      } catch (_) { res.end(); }
-    };
-    pump();
-
-    req.on('close', () => reader.cancel().catch(()=>{}));
-
-  } catch (err) {
-    console.error('[STREAM ERROR]', err.message);
-
-    // Fallback: streaming direto via yt-dlp pipe → resposta HTTP
+  // Tenta cada cliente até conseguir uma URL válida
+  let audioUrl = null;
+  let usedClient = null;
+  for (const client of YT_CLIENTS) {
     try {
-      console.log('[STREAM] Tentando pipe direto via yt-dlp...');
-      const proc = spawn(YTDLP, [
-        '-o', '-',
-        '-f', 'bestaudio[ext=m4a]/bestaudio/best',
-        ...ytdlpBaseArgs,
+      const url = await ytdlp([
+        '-g', '-f', 'bestaudio[ext=m4a]/bestaudio/best',
+        ...buildArgs(client),
         ytUrl,
-      ], { stdio: ['ignore', 'pipe', 'pipe'] });
-
-      res.setHeader('Content-Type', 'audio/webm');
-      res.setHeader('Accept-Ranges', 'bytes');
-      res.setHeader('Cache-Control', 'no-cache');
-      res.status(200);
-
-      proc.stdout.pipe(res);
-      req.on('close', () => proc.kill());
-      proc.on('error', () => { if (!res.writableEnded) res.end(); });
-      proc.stderr.on('data', d => console.error('[YT-DLP STDERR]', d.toString()));
-
-    } catch (err2) {
-      console.error('[STREAM PIPE ERROR]', err2.message);
-      if (!res.headersSent) {
-        res.status(500).json({ error: 'Stream falhou em todos os métodos', details: err2.message });
+      ]);
+      if (url && url.startsWith('http')) {
+        audioUrl = url;
+        usedClient = client;
+        break;
       }
+    } catch (e) {
+      console.log(`[STREAM] Cliente ${client} falhou: ${e.message.slice(0, 80)}`);
     }
   }
+
+  if (audioUrl) {
+    console.log(`[STREAM] ✅ URL via cliente "${usedClient}"`);
+    try {
+      const range   = req.headers.range;
+      const headers = { 'User-Agent': 'Mozilla/5.0' };
+      if (range) headers['Range'] = range;
+
+      const upstream = await fetch(audioUrl, { headers, signal: AbortSignal.timeout(20000) });
+      if (!upstream.ok && upstream.status !== 206) throw new Error(`HTTP ${upstream.status}`);
+
+      const ct = upstream.headers.get('content-type') || 'audio/mp4';
+      const cl = upstream.headers.get('content-length');
+      const cr = upstream.headers.get('content-range');
+      res.setHeader('Content-Type', ct);
+      res.setHeader('Accept-Ranges', 'bytes');
+      res.setHeader('Cache-Control', 'no-cache');
+      if (cl) res.setHeader('Content-Length', cl);
+      if (cr) res.setHeader('Content-Range', cr);
+      res.status(upstream.status === 206 ? 206 : 200);
+
+      const reader = upstream.body.getReader();
+      const pump = async () => {
+        try {
+          const { done, value } = await reader.read();
+          if (done || res.writableEnded) { res.end(); return; }
+          res.write(value); pump();
+        } catch (_) { res.end(); }
+      };
+      pump();
+      req.on('close', () => reader.cancel().catch(() => {}));
+      return;
+    } catch (e) {
+      console.error('[STREAM] Proxy falhou, tentando pipe:', e.message);
+    }
+  }
+
+  // Último recurso: pipe direto do yt-dlp → cliente
+  console.log('[STREAM] Tentando pipe direto...');
+  const client = usedClient || 'tv_embedded';
+  const proc = spawn(YTDLP, [
+    '-o', '-', '-f', 'bestaudio[ext=m4a]/bestaudio/best',
+    ...buildArgs(client), ytUrl,
+  ], { stdio: ['ignore', 'pipe', 'pipe'] });
+
+  if (res.headersSent) { proc.kill(); return; }
+  res.setHeader('Content-Type', 'audio/mp4');
+  res.setHeader('Accept-Ranges', 'bytes');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.status(200);
+  proc.stdout.pipe(res);
+  req.on('close', () => proc.kill());
+  proc.on('error', () => { if (!res.writableEnded) res.end(); });
+  proc.stderr.on('data', d => {
+    const msg = d.toString();
+    if (!msg.includes('WARNING')) console.error('[YT-DLP]', msg.slice(0, 120));
+  });
 });
 
 // ──────────────────────────────────────────────────────────────
